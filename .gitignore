@@ -1,0 +1,23 @@
+# Default application files, account data, cache and configuration backups.
+_local/
+
+# Keep runtime data out of source exports, including custom storage folders.
+downloads/
+versions/
+staging/
+portable-profile/
+configuration-backups/
+active.json
+complete.json
+pipeline.lock
+Start-ChatGPT.cmd
+
+# Downloaded packages, shortcuts and diagnostics.
+*.msix
+*.msixbundle
+*.appx
+*.appxbundle
+ChatGPT-License.xml
+*.partial.msix
+*.lnk
+*.log
