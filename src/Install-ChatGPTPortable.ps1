@@ -2,62 +2,59 @@
 
 <#
 .SYNOPSIS
-Downloads the latest official ChatGPT MSIX and prepares current-user portable startup.
+下载官方 ChatGPT 包，配置当前用户的免安装启动入口。
 
 .DESCRIPTION
-Requires Windows PowerShell 5.1 and the system curl.exe for online downloads.
-Verifies the Windows signatures, expected package identity and original app files
-before configuring a launcher and optional current-user shortcuts. Does not
-register the MSIX, install system services or request Windows administrator rights.
-ChatGPT still requires an internet connection; MSIX is an offline installation
-package, not an offline language model.
+使用 Windows PowerShell 5.1 和系统 curl.exe。验证官方签名、包标识和原始
+应用文件后，创建启动入口及可选快捷方式。无需管理员权限，不注册 MSIX，
+不安装系统服务。登录和对话仍需联网。
 
 .PARAMETER StorageRoot
-Folder for downloads, extracted versions, launcher and profile. Defaults to the
-_local folder beside this project's install.cmd. Relative paths use the caller's
-PowerShell working directory.
+保存下载包、程序和用户配置的目录。默认复用已有目录；首次使用保存到
+LocalAppData\ChatGPT-NoAdmin。相对路径按调用者的工作目录解析。
 
 .PARAMETER Architecture
-Package architecture: auto (detect Windows), x64 or arm64.
+系统架构：auto 自动识别，或指定 x64、arm64。
 
 .PARAMETER PackagePath
-Use an existing official MSIX instead of checking or downloading the latest online
-version. The local package must pass the same signature and manifest checks.
+使用已下载的官方 MSIX，不检查在线版本；仍进行签名和清单校验。
 
 .PARAMETER ForceDownload
-Download again even when the verified package cache matches the official endpoint.
-Cannot be combined with PackagePath.
+重新下载官方包，不复用缓存；不能与 PackagePath 同时使用。
 
 .PARAMETER NoShortcuts
-Configure only the launcher and active.json; do not change desktop or Start menu
-shortcuts.
+只配置启动文件，不创建桌面和开始菜单快捷方式。
 
 .PARAMETER Launch
-Start the configured application after successful setup. Close an older running
-instance yourself before switching versions.
+配置成功后启动应用。切换版本前，请先退出正在运行的旧实例。
+
+.PARAMETER KeepOldVersions
+保留旧版本。默认清理未运行的完整旧版本，保留运行中的版本和用户数据。
 
 .PARAMETER SignatureTimeoutSeconds
-Maximum time for each Windows signature verification. Default: 180 seconds.
+每次签名验证的超时时间，默认 180 秒。
+
+.PARAMETER OutputJson
+额外输出完整配置 JSON，供诊断使用；默认只显示中文提示。
 
 .PARAMETER Help
-Display this help without creating files, downloading or configuring anything.
+显示参数帮助，不下载或配置应用。
 
 .EXAMPLE
 .\install.cmd -Launch
-From the project folder, check the latest official package, prepare portable
-startup and launch ChatGPT.
+检查官方最新版本，完成免安装配置并启动 ChatGPT。
 
 .EXAMPLE
 .\install.cmd -StorageRoot ".\app-data" -NoShortcuts
-Use a custom writable storage folder without changing user shortcuts.
+使用指定保存目录，不创建快捷方式。
 
 .EXAMPLE
 .\install.cmd -PackagePath ".\ChatGPT-x64.msix" -NoShortcuts
-Prepare startup from an already downloaded package without checking for updates.
+使用已下载的官方包，不检查在线版本。
 
 .EXAMPLE
 .\install.cmd -Help
-Display all parameters and usage examples without changing anything.
+查看完整参数和使用示例。
 #>
 [CmdletBinding()]
 param(
@@ -67,7 +64,9 @@ param(
     [switch]$ForceDownload,
     [switch]$NoShortcuts,
     [switch]$Launch,
+    [switch]$KeepOldVersions,
     [ValidateRange(10, 1800)][int]$SignatureTimeoutSeconds = 180,
+    [switch]$OutputJson,
     [switch]$Help
 )
 
@@ -77,6 +76,7 @@ if ($Help) {
 }
 
 $ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 Set-StrictMode -Version 2.0
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 
@@ -86,8 +86,149 @@ function Resolve-FileSystemPath {
     $pathDrive = $null
     $resolvedPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(
         $Path, [ref]$pathProvider, [ref]$pathDrive)
-    if ($pathProvider.Name -ne 'FileSystem') { throw 'A FileSystem path is required.' }
+    if ($pathProvider.Name -ne 'FileSystem') { throw '请指定本地文件或文件夹路径。' }
     return [IO.Path]::GetFullPath($resolvedPath)
+}
+
+function Test-PortableInstallation {
+    param([string]$Path)
+    try {
+        $state = Get-Content -LiteralPath (Join-Path $Path 'active.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+        return $state.Mode -eq 'Portable' -and $state.PackageVersion -match '^\d+\.\d+\.\d+\.\d+$' -and
+            $state.Architecture -in @('x64', 'arm64') -and $state.SHA256 -match '^[a-fA-F0-9]{64}$' -and
+            (Test-Path -LiteralPath (Join-Path $Path 'versions') -PathType Container) -and
+            (Test-Path -LiteralPath (Join-Path $Path 'Start-ChatGPT.cmd') -PathType Leaf)
+    } catch { return $false }
+}
+
+function Get-ShortcutStorageRoots {
+    param([string[]]$ShortcutPaths)
+    try {
+        $shell = New-Object -ComObject WScript.Shell
+        foreach ($path in $ShortcutPaths) {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
+            $target = $shell.CreateShortcut($path).TargetPath
+            if ($target -notmatch '(?i)[\\/]versions[\\/][^\\/]+[\\/]app[\\/]ChatGPT\.exe$') { continue }
+            $root = $target
+            for ($index = 0; $index -lt 4; $index++) { $root = [IO.Path]::GetDirectoryName($root) }
+            if (-not [string]::IsNullOrEmpty($root)) { $root }
+        }
+    } catch { Write-Warning '无法读取已有快捷方式，正在检查其他保存位置。' }
+}
+
+function Get-PortableStorageRoot {
+    param([string]$RequestedRoot, [string]$DefaultRoot, [string]$LegacyRoot, [string[]]$ShortcutRoots = @())
+    if (-not [string]::IsNullOrWhiteSpace($RequestedRoot)) { return Resolve-FileSystemPath $RequestedRoot }
+    $recordPath = Join-Path $DefaultRoot 'storage-root.json'
+    $rememberedRoot = $null
+    if (Test-Path -LiteralPath $recordPath -PathType Leaf) {
+        try {
+            $record = Get-Content -LiteralPath $recordPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($record.Mode -eq 'Portable' -and -not [string]::IsNullOrWhiteSpace($record.StorageRoot) -and
+                [IO.Path]::IsPathRooted($record.StorageRoot)) {
+                $rememberedRoot = Resolve-FileSystemPath $record.StorageRoot
+                if (Test-Path -LiteralPath $rememberedRoot -PathType Container) { return $rememberedRoot }
+            }
+        } catch { Write-Warning '无法读取保存位置记录，正在查找已有免安装配置。' }
+    }
+    foreach ($candidate in @($ShortcutRoots) + @($LegacyRoot)) {
+        if (-not [string]::IsNullOrWhiteSpace($candidate) -and (Test-PortableInstallation $candidate)) {
+            return Resolve-FileSystemPath $candidate
+        }
+    }
+    if ($null -ne $rememberedRoot) {
+        throw "原保存目录不存在：$rememberedRoot。请重新连接该目录，或用 -StorageRoot 指定移动后的路径。"
+    }
+    return Resolve-FileSystemPath $DefaultRoot
+}
+
+function Test-NoReparsePoints {
+    param([string]$Path)
+    $pending = [Collections.Generic.Stack[string]]::new()
+    $pending.Push($Path)
+    while ($pending.Count -gt 0) {
+        $item = Get-Item -LiteralPath $pending.Pop() -Force -ErrorAction Stop
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $false }
+        if ($item.PSIsContainer) {
+            foreach ($child in Get-ChildItem -LiteralPath $item.FullName -Force -ErrorAction Stop) {
+                if (($child.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $false }
+                if ($child.PSIsContainer) { $pending.Push($child.FullName) }
+            }
+        }
+    }
+    return $true
+}
+
+function Get-RunningChatGPTPaths {
+    foreach ($process in Get-Process -ErrorAction Stop) {
+        try { $path = $process.Path } catch {
+            if ($process.ProcessName -eq 'ChatGPT') { throw '无法确定正在运行的 ChatGPT 的路径。' }
+            continue
+        }
+        if (-not [string]::IsNullOrWhiteSpace($path)) { $path }
+        elseif ($process.ProcessName -eq 'ChatGPT') { throw '无法确定正在运行的 ChatGPT 的路径。' }
+    }
+}
+
+function Remove-OldVersions {
+    param([string]$StorageRoot, [string]$ActiveVersionDirectory)
+    try {
+        $root = Resolve-FileSystemPath $StorageRoot
+        $versionsRoot = Join-Path $root 'versions'
+        $active = Resolve-FileSystemPath $ActiveVersionDirectory
+        if ([IO.Path]::GetDirectoryName($active) -ne $versionsRoot -or
+            -not (Test-Path -LiteralPath $active -PathType Container)) {
+            Write-Warning '已跳过旧版本清理：当前版本不在本保存目录内，或文件夹已不存在。'
+            return
+        }
+        $path = $versionsRoot
+        while (-not [string]::IsNullOrEmpty($path)) {
+            if (((Get-Item -LiteralPath $path -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                Write-Warning '已跳过旧版本清理：保存路径包含目录链接。'
+                return
+            }
+            $parent = [IO.Directory]::GetParent($path)
+            $path = $(if ($null -ne $parent) { $parent.FullName } else { $null })
+        }
+        $runningPaths = @(Get-RunningChatGPTPaths)
+        $versionsPrefix = $versionsRoot + [IO.Path]::DirectorySeparatorChar
+        foreach ($directory in Get-ChildItem -LiteralPath $versionsRoot -Directory -Force) {
+            $candidate = [IO.Path]::GetFullPath($directory.FullName)
+            if ($candidate -eq $active) { continue }
+            if (-not $candidate.StartsWith($versionsPrefix, [StringComparison]::OrdinalIgnoreCase) -or
+                [IO.Path]::GetDirectoryName($candidate) -ne $versionsRoot) { continue }
+            if ($directory.Name -notmatch '^\d+\.\d+\.\d+\.\d+-(x64|arm64)-[a-f0-9]{12}$') {
+                Write-Warning "保留无法识别的版本目录：$($directory.Name)"
+                continue
+            }
+            try {
+                if (-not (Test-NoReparsePoints $candidate)) {
+                    Write-Warning "保留包含文件或目录链接的旧版本：$($directory.Name)"
+                    continue
+                }
+                $complete = Get-Content -LiteralPath (Join-Path $candidate 'complete.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+                if ($complete.Version -notmatch '^\d+\.\d+\.\d+\.\d+$' -or
+                    $complete.Architecture -notin @('x64', 'arm64') -or $complete.SHA256 -notmatch '^[a-fA-F0-9]{64}$') {
+                    Write-Warning "保留完成记录无效的旧版本：$($directory.Name)"
+                    continue
+                }
+                $expectedName = $complete.Version + '-' + $complete.Architecture + '-' + $complete.SHA256.Substring(0, 12).ToLowerInvariant()
+                if ($directory.Name -ne $expectedName) {
+                    Write-Warning "保留完成记录与目录不符的旧版本：$($directory.Name)"
+                    continue
+                }
+                $candidatePrefix = $candidate + [IO.Path]::DirectorySeparatorChar
+                $runningPaths = @(Get-RunningChatGPTPaths)
+                $inUse = @($runningPaths | Where-Object { $_.StartsWith($candidatePrefix, [StringComparison]::OrdinalIgnoreCase) }).Count -gt 0
+                if ($inUse) {
+                    Write-Warning "保留正在运行的版本 $($directory.Name)。退出应用后再次更新即可清理。"
+                    continue
+                }
+                Remove-Item -LiteralPath $candidate -Recurse -Force -ErrorAction Stop
+                Write-Host "已清理旧版本：$($directory.Name)"
+            } catch { Write-Warning "已保留旧版本 $($directory.Name)：$($_.Exception.Message)" }
+        }
+    } catch { Write-Warning "已跳过旧版本清理：$($_.Exception.Message)" }
 }
 
 function Write-AtomicBytes {
@@ -107,7 +248,7 @@ function Write-AtomicBytes {
 
 function Get-BoundedSignature {
     param([string]$Path)
-    Write-Host "Checking the Windows signature (timeout: $SignatureTimeoutSeconds seconds): $([IO.Path]::GetFileName($Path))"
+    Write-Host "正在验证签名（最多等待 $SignatureTimeoutSeconds 秒）：$([IO.Path]::GetFileName($Path))"
     $encodedPath = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Path))
     $workerCode = @"
 `$ErrorActionPreference = 'Stop'
@@ -138,20 +279,20 @@ try {
     $worker.StartInfo = $startInfo
     $workerStarted = $false
     try {
-        if (-not $worker.Start()) { throw 'Could not start the Windows signature verification worker.' }
+        if (-not $worker.Start()) { throw '无法启动 Windows 签名验证进程。' }
         $workerStarted = $true
         $outputTask = $worker.StandardOutput.ReadToEndAsync()
         $errorTask = $worker.StandardError.ReadToEndAsync()
         if (-not $worker.WaitForExit($SignatureTimeoutSeconds * 1000)) {
             $worker.Kill()
             $worker.WaitForExit()
-            throw [TimeoutException]::new('Windows signature verification timed out. The package was not activated. A completed download is retained; retry or inspect Windows trust verification.')
+            throw [TimeoutException]::new('签名验证超时，未启用该包。完整下载已保留，请重试；也可用 -SignatureTimeoutSeconds 600 延长等待。')
         }
         $output = $outputTask.GetAwaiter().GetResult()
         $errorOutput = $errorTask.GetAwaiter().GetResult()
-        if ($worker.ExitCode -ne 0) { throw "Windows signature verification failed: $errorOutput" }
+        if ($worker.ExitCode -ne 0) { throw "Windows 签名验证失败：$errorOutput" }
         $signature = $output | ConvertFrom-Json
-        if ($signature.Status -ne 'Valid') { throw "Windows signature verification failed: $($signature.Status): $($signature.Message)" }
+        if ($signature.Status -ne 'Valid') { throw "Windows 签名验证失败：$($signature.Status)：$($signature.Message)" }
         return $signature
     } finally {
         try {
@@ -159,7 +300,7 @@ try {
                 $worker.Kill()
                 $worker.WaitForExit()
             }
-        } catch { Write-Warning 'Could not finish cleanup of the signature verification worker.' }
+        } catch { Write-Warning '未能完成签名验证进程的清理。' }
         $worker.Dispose()
     }
 }
@@ -170,32 +311,32 @@ function Get-VerifiedPackage {
     $archive = [IO.Compression.ZipFile]::OpenRead($Path)
     try {
         $entry = $archive.GetEntry('AppxManifest.xml')
-        if ($null -eq $entry) { throw 'AppxManifest.xml is missing.' }
+        if ($null -eq $entry) { throw '官方包中缺少 AppxManifest.xml 清单。' }
         $reader = [IO.StreamReader]::new($entry.Open())
         try { [xml]$manifest = $reader.ReadToEnd() } finally { $reader.Dispose() }
         $identity = $manifest.GetElementsByTagName('Identity')[0]
-        if ($null -eq $identity) { throw 'The package identity is missing.' }
+        if ($null -eq $identity) { throw '官方包缺少包标识。' }
         $publisher = $identity.GetAttribute('Publisher')
         if ($identity.GetAttribute('Name') -ne 'OpenAI.Codex' -or
             $publisher -ne 'CN=50BDFD77-8903-4850-9FFE-6E8522F64D5B' -or
             $signature.Subject -ne $publisher) {
-            throw 'This is not the expected Store-signed OpenAI.Codex package.'
+            throw '包标识或发布者不符，无法确认是预期的官方签名 OpenAI.Codex 包。'
         }
         $packageArchitecture = $identity.GetAttribute('ProcessorArchitecture')
         if ($packageArchitecture -ne $ExpectedArchitecture) {
-            throw "Package architecture $packageArchitecture does not match $ExpectedArchitecture."
+            throw "包架构 $packageArchitecture 与所选架构 $ExpectedArchitecture 不符。"
         }
         foreach ($family in $manifest.GetElementsByTagName('TargetDeviceFamily')) {
             if ([Environment]::OSVersion.Version -lt [version]$family.GetAttribute('MinVersion')) {
-                throw "This package requires Windows $($family.GetAttribute('MinVersion')) or newer."
+                throw "该版本要求 Windows $($family.GetAttribute('MinVersion')) 或更高版本。"
             }
         }
         if ($manifest.GetElementsByTagName('PackageDependency').Count -gt 0) {
-            throw 'This package now declares framework dependencies. Unpackaged startup must be reassessed.'
+            throw '官方包新增了系统框架依赖，需要重新确认免安装启动方式。'
         }
         if ($null -eq $archive.GetEntry('app/ChatGPT.exe') -or
             $null -eq $archive.GetEntry('app/resources/app.asar')) {
-            throw 'The expected app/ executable and resources are missing. The package layout may have changed.'
+            throw '缺少预期的程序或资源文件，官方包的文件布局可能已改变。'
         }
         return [pscustomobject]@{
             Version = ([version]$identity.GetAttribute('Version')).ToString()
@@ -211,7 +352,7 @@ function Invoke-OfficialCurl {
     param([string[]]$Arguments)
     $curl = Get-Command curl.exe -ErrorAction Stop
     & $curl.Source '--disable' @Arguments
-    if ($LASTEXITCODE -ne 0) { throw "curl.exe failed with exit code $LASTEXITCODE. TLS verification remains enabled." }
+    if ($LASTEXITCODE -ne 0) { throw "下载或版本查询失败（curl.exe 退出码：$LASTEXITCODE）。请检查网络连接后重试。" }
 }
 
 function Get-LatestMetadata {
@@ -241,12 +382,12 @@ function Assert-AppExecutable {
     param([string]$AppDirectory)
     foreach ($relative in @('ChatGPT.exe', 'chrome.dll', 'resources\app.asar', 'resources\icon-chatgpt.ico')) {
         if (-not (Test-Path -LiteralPath (Join-Path $AppDirectory $relative) -PathType Leaf)) {
-            throw "Required portable file is missing: $relative"
+            throw "缺少免安装启动所需文件：$relative"
         }
     }
     $signature = Get-BoundedSignature (Join-Path $AppDirectory 'ChatGPT.exe')
     if ($signature.Subject -notmatch 'OpenAI OpCo, LLC') {
-        throw 'The extracted ChatGPT.exe does not have a valid OpenAI signature.'
+        throw '解压后的 ChatGPT.exe 未通过 OpenAI 签名验证。'
     }
 }
 
@@ -261,7 +402,7 @@ function Expand-AppFiles {
             if ($relative.Length -eq 0) { continue }
             $target = [IO.Path]::GetFullPath((Join-Path $AppDirectory $relative))
             if (-not $target.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
-                throw "Archive path escapes the application directory: $($entry.FullName)"
+                throw "包内文件路径越出应用目录，已停止解压：$($entry.FullName)"
             }
         }
         $count = 0
@@ -293,7 +434,7 @@ function Assert-CachedFiles {
             [void]$expectedFiles.Add([IO.Path]::GetFullPath($filePath))
             if (-not (Test-Path -LiteralPath $filePath -PathType Leaf) -or
                 (Get-Item -LiteralPath $filePath).Length -ne $entry.Length) {
-                throw "Cached version is incomplete: $($entry.FullName). Keep it for diagnosis and use another StorageRoot."
+                throw "已有版本缺少文件或文件大小不符：$($entry.FullName)。请修复报错中的版本目录，再使用原保存目录重试。"
             }
             $sourceStream = $entry.Open()
             $fileStream = $null
@@ -302,7 +443,7 @@ function Assert-CachedFiles {
                 $sourceHash = [BitConverter]::ToString($sha256.ComputeHash($sourceStream))
                 $fileHash = [BitConverter]::ToString($sha256.ComputeHash($fileStream))
                 if ($sourceHash -ne $fileHash) {
-                    throw "Cached file differs from the verified package: $($entry.FullName). Use another StorageRoot."
+                    throw "已有文件与已验证官方包不符：$($entry.FullName)。请修复该版本目录，再使用原保存目录重试。"
                 }
             } finally {
                 $sourceStream.Dispose()
@@ -311,7 +452,7 @@ function Assert-CachedFiles {
         }
         foreach ($file in Get-ChildItem -LiteralPath $AppDirectory -File -Recurse -Force) {
             if (-not $expectedFiles.Contains($file.FullName)) {
-                throw "Cached version contains a file absent from the verified package: $($file.Name). Use another StorageRoot."
+                throw "已有版本包含官方包中没有的文件：$($file.Name)。请修复该版本目录，再使用原保存目录重试。"
             }
         }
     } finally { $sha256.Dispose(); $archive.Dispose() }
@@ -338,7 +479,7 @@ function Commit-Configuration {
             try {
                 if ($null -ne $item.Previous) { Write-AtomicBytes -Path $item.Path -Bytes $item.Previous }
                 elseif ([IO.File]::Exists($item.Path)) { [IO.File]::Delete($item.Path) }
-            } catch { Write-Warning "Could not restore $($item.Path); the previous file is in $BackupDirectory." }
+            } catch { Write-Warning "未能恢复 $($item.Path)；原文件备份位于 $BackupDirectory。" }
         }
         throw
     }
@@ -349,11 +490,21 @@ $stageDirectory = $null
 $runId = [guid]::NewGuid().ToString('N')
 $utf8 = [Text.UTF8Encoding]::new($false)
 try {
-    if ($env:OS -ne 'Windows_NT') { throw 'This pipeline requires Windows.' }
+    $configurationCommitted = $false
+    if ($env:OS -ne 'Windows_NT') { throw '此工具只能在 Windows 上运行。' }
+    $localAppData = [Environment]::GetFolderPath('LocalApplicationData')
+    if ([string]::IsNullOrWhiteSpace($localAppData)) { throw '无法获取当前用户的应用数据目录。' }
+    $defaultRoot = Join-Path $localAppData 'ChatGPT-NoAdmin'
+    $shortcutRoots = @()
     if ([string]::IsNullOrWhiteSpace($StorageRoot)) {
-        $StorageRoot = Join-Path $PSScriptRoot '..\_local'
+        $existingShortcuts = @()
+        foreach ($folder in @([Environment]::GetFolderPath('Desktop'), [Environment]::GetFolderPath('Programs'))) {
+            if (-not [string]::IsNullOrEmpty($folder)) { $existingShortcuts += Join-Path $folder 'ChatGPT（免安装）.lnk' }
+        }
+        $shortcutRoots = @(Get-ShortcutStorageRoots -ShortcutPaths $existingShortcuts)
     }
-    $StorageRoot = Resolve-FileSystemPath $StorageRoot
+    $StorageRoot = Get-PortableStorageRoot -RequestedRoot $StorageRoot -DefaultRoot $defaultRoot -LegacyRoot (Join-Path $PSScriptRoot '..\_local') -ShortcutRoots $shortcutRoots
+    Write-Host "保存位置：$StorageRoot"
     $downloadsDirectory = Join-Path $StorageRoot 'downloads'
     $versionsDirectory = Join-Path $StorageRoot 'versions'
     $stagingDirectory = Join-Path $StorageRoot 'staging'
@@ -363,23 +514,23 @@ try {
     try {
         $lockStream = [IO.File]::Open((Join-Path $StorageRoot 'pipeline.lock'), [IO.FileMode]::OpenOrCreate,
             [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
-    } catch { throw 'Cannot lock this StorageRoot. Another pipeline may be running, or the folder is not writable.' }
+    } catch { throw '无法锁定保存目录。另一个配置流程可能正在运行，或当前用户没有目录写入权限。' }
 
     $nativeArchitecture = $env:PROCESSOR_ARCHITEW6432
     if ([string]::IsNullOrWhiteSpace($nativeArchitecture)) { $nativeArchitecture = $env:PROCESSOR_ARCHITECTURE }
-    if ($nativeArchitecture -notin @('AMD64', 'ARM64')) { throw "Unsupported Windows architecture: $nativeArchitecture" }
+    if ($nativeArchitecture -notin @('AMD64', 'ARM64')) { throw "不支持此 Windows 架构：$nativeArchitecture" }
     if ($Architecture -eq 'auto') {
         switch ($nativeArchitecture.ToUpperInvariant()) {
             'AMD64' { $Architecture = 'x64' }
             'ARM64' { $Architecture = 'arm64' }
-            default { throw "Unsupported Windows architecture: $nativeArchitecture" }
+            default { throw "不支持此 Windows 架构：$nativeArchitecture" }
         }
     }
     if ($nativeArchitecture -eq 'AMD64' -and $Architecture -eq 'arm64') {
-        throw 'An Arm64 package cannot run on this x64 Windows system.'
+        throw '此 x64 Windows 系统无法运行 Arm64 包。'
     }
     if ($ForceDownload -and -not [string]::IsNullOrWhiteSpace($PackagePath)) {
-        throw 'ForceDownload cannot be combined with PackagePath.'
+        throw '-ForceDownload 不能与 -PackagePath 同时使用。'
     }
 
     $sourceUri = 'https://persistent.oaistatic.com/codex-app-prod/ChatGPT-' + $Architecture + '.msix'
@@ -388,10 +539,10 @@ try {
     $remote = $null
     if (-not [string]::IsNullOrWhiteSpace($PackagePath)) {
         $packageFile = Resolve-FileSystemPath $PackagePath
-        Write-Host 'Using the specified local package. The latest online version is not checked.'
+        Write-Host '正在使用指定的本地包，不检查在线版本。'
         $package = Get-VerifiedPackage $packageFile $Architecture
     } else {
-        Write-Host "Checking the latest official $Architecture package..."
+        Write-Host "正在检查官方最新版本（$Architecture）……"
         $remote = Get-LatestMetadata -Uri $sourceUri -Directory $downloadsDirectory
         $latestChecked = $true
         $packageFile = Join-Path $downloadsDirectory ('ChatGPT-' + $Architecture + '.msix')
@@ -408,7 +559,7 @@ try {
                 }
             } catch {
                 if ($_.Exception -is [TimeoutException]) { throw }
-                Write-Warning 'The download cache cannot be reused; downloading a verified replacement.'
+                Write-Warning '已有下载缓存无法复用，正在重新下载官方包。'
             }
         }
         if (-not $useCache) {
@@ -424,16 +575,16 @@ try {
                 } catch { $reusePending = $false }
             }
             if ($reusePending) {
-                Write-Host 'Rechecking the retained complete download. It is not trusted until signature and manifest checks pass.'
+                Write-Host '正在重新验证上次保留的完整下载，通过签名和清单检查后才会使用。'
             } else {
                 $partialFile = Join-Path $downloadsDirectory ('ChatGPT-' + $Architecture + '-' + $runId + '.partial.msix')
-                Write-Host "Downloading $sourceUri"
+                Write-Host '正在下载官方包，首次下载可能需要几分钟，请稍候……'
                 try {
                     Invoke-OfficialCurl -Arguments @('--fail', '--location', '--silent', '--show-error', '--retry', '2',
                         '--connect-timeout', '30', '--max-time', '3600', '--output', $partialFile, $sourceUri)
                     if (-not [string]::IsNullOrEmpty($remote.ContentLength) -and
                         (Get-Item -LiteralPath $partialFile).Length -ne [long]$remote.ContentLength) {
-                        throw 'The download size differs from the HEAD response. Retry; the endpoint may have updated during the download.'
+                        throw '下载大小与官方版本信息不符，下载期间可能发布了新版，请重试。'
                     }
                     $pendingMetadata = [ordered]@{SourceUri=$sourceUri;ETag=$remote.ETag;Bytes=(Get-Item -LiteralPath $partialFile).Length}
                     if ([IO.File]::Exists($pendingFile)) { [IO.File]::Replace($partialFile, $pendingFile, [Management.Automation.Language.NullString]::Value) }
@@ -446,14 +597,14 @@ try {
             }
             $package = Get-VerifiedPackage $pendingFile $Architecture
             if (-not [string]::IsNullOrEmpty($remote.Version) -and $package.Version -ne $remote.Version) {
-                throw 'The package version differs from the HEAD response. Retry to fetch a consistent latest package.'
+                throw '下载包与官方版本信息不符，请重试以获取完整的最新包。'
             }
             if ([IO.File]::Exists($packageFile)) { [IO.File]::Replace($pendingFile, $packageFile, [Management.Automation.Language.NullString]::Value) }
             else { [IO.File]::Move($pendingFile, $packageFile) }
             [IO.File]::Delete($pendingMetadataFile)
             $metadata = [ordered]@{SourceUri=$sourceUri;ETag=$remote.ETag;Version=$package.Version;SHA256=$package.SHA256;Bytes=$package.Bytes}
             Write-AtomicBytes -Path $metadataFile -Bytes $utf8.GetBytes(($metadata | ConvertTo-Json))
-        } else { Write-Host 'The cached official package matches the current endpoint; its signature and SHA256 were rechecked.' }
+        } else { Write-Host '已是官方当前版本，签名和文件校验通过，无需重新下载。' }
     }
 
     $versionName = $package.Version + '-' + $Architecture + '-' + $package.SHA256.Substring(0, 12).ToLowerInvariant()
@@ -463,13 +614,13 @@ try {
     $stageDirectory = Join-Path $stagingDirectory $runId
     [IO.Directory]::CreateDirectory($stageDirectory) | Out-Null
     if (Test-Path -LiteralPath $versionDirectory) {
-        if (-not (Test-Path -LiteralPath $completeFile)) { throw 'The version directory has no completion record. Use another StorageRoot.' }
+        if (-not (Test-Path -LiteralPath $completeFile)) { throw '版本目录缺少完成记录，请修复该版本目录，再使用原保存目录重试。' }
         $complete = Get-Content -LiteralPath $completeFile -Raw -Encoding UTF8 | ConvertFrom-Json
-        if ($complete.SHA256 -ne $package.SHA256) { throw 'The cached version completion record does not match this package.' }
+        if ($complete.SHA256 -ne $package.SHA256) { throw '已有版本的完成记录与官方包不符。' }
         Assert-CachedFiles $packageFile $appDirectory
-        Write-Host "Reusing extracted version $($package.Version)."
+        Write-Host "已有程序文件校验通过，继续使用版本 $($package.Version)。"
     } else {
-        Write-Host "Extracting the original app files for version $($package.Version)..."
+        Write-Host "正在解压官方原始文件：版本 $($package.Version)……"
         $stageAppDirectory = Join-Path $stageDirectory 'app'
         $fileCount = Expand-AppFiles $packageFile $stageAppDirectory
         Assert-AppExecutable $stageAppDirectory
@@ -491,7 +642,7 @@ try {
         for ($index = 0; $index -lt $shortcutFolders.Count; $index++) {
             $folder = $shortcutFolders[$index]
             if ([string]::IsNullOrEmpty($folder) -or -not (Test-Path -LiteralPath $folder -PathType Container)) {
-                throw 'A current-user shortcut folder is unavailable. Use NoShortcuts to configure only the launcher.'
+                throw '当前用户的快捷方式目录不可用。可用 -NoShortcuts 只配置保存目录中的启动文件。'
             }
             $temporaryShortcut = Join-Path $stageDirectory $labels[$index]
             $shortcut = $shell.CreateShortcut($temporaryShortcut)
@@ -499,7 +650,7 @@ try {
             $shortcut.Arguments = '--user-data-dir="' + $profileDirectory + '"'
             $shortcut.WorkingDirectory = $appDirectory
             $shortcut.IconLocation = Join-Path $appDirectory 'resources\icon-chatgpt.ico'
-            $shortcut.Description = 'ChatGPT extracted for current-user startup. Windows services are not installed.'
+            $shortcut.Description = 'ChatGPT 免安装启动（当前用户权限）'
             $shortcut.Save()
             $shortcutPath = Join-Path $folder $shortcutName
             $shortcutPaths += $shortcutPath
@@ -510,15 +661,24 @@ try {
     $launcherPath = Join-Path $StorageRoot 'Start-ChatGPT.cmd'
     $launcher = @"
 @echo off
+chcp 65001 >nul
 setlocal DisableDelayedExpansion
 if not exist "%~dp0versions\$versionName\app\ChatGPT.exe" (
-    echo ChatGPT.exe was not found. Run the setup pipeline again.
+    echo [失败] 找不到 ChatGPT 程序，请重新双击项目中的 install.cmd 完成配置。
+    pause
     exit /b 1
 )
 start "" /D "%~dp0versions\$versionName\app" "%~dp0versions\$versionName\app\ChatGPT.exe" --user-data-dir="%~dp0portable-profile"
+if errorlevel 1 (
+    echo [失败] 无法启动 ChatGPT，请检查程序文件和当前用户的运行权限。
+    pause
+    exit /b 1
+)
+exit /b 0
 "@
     $state = [ordered]@{
         Mode = 'Portable'
+        StorageRoot = $StorageRoot
         ConfiguredAt = [DateTimeOffset]::Now.ToString('o')
         PackageVersion = $package.Version
         Architecture = $Architecture
@@ -534,20 +694,42 @@ start "" /D "%~dp0versions\$versionName\app" "%~dp0versions\$versionName\app\Cha
         SystemServiceInstalledByPipeline = $false
         PackageRegisteredByPipeline = $false
     }
-    $launcherBytes = [Text.Encoding]::ASCII.GetBytes(($launcher -replace '\r?\n', "`r`n") + "`r`n")
+    $launcherBytes = $utf8.GetBytes(($launcher -replace '\r?\n', "`r`n") + "`r`n")
     $changes.Add([pscustomobject]@{Path=$launcherPath;Label='Start-ChatGPT.cmd';Bytes=$launcherBytes})
     $changes.Add([pscustomobject]@{Path=(Join-Path $StorageRoot 'active.json');Label='active.json';Bytes=$utf8.GetBytes(($state | ConvertTo-Json -Depth 4))})
+    [IO.Directory]::CreateDirectory($defaultRoot) | Out-Null
+    $storageRecord = [ordered]@{Mode='Portable';StorageRoot=$StorageRoot}
+    $changes.Add([pscustomobject]@{Path=(Join-Path $defaultRoot 'storage-root.json');Label='storage-root.json';Bytes=$utf8.GetBytes(($storageRecord | ConvertTo-Json))})
     $backupDirectory = Join-Path (Join-Path $StorageRoot 'configuration-backups') $runId
     Commit-Configuration -Changes $changes.ToArray() -BackupDirectory $backupDirectory
-    Write-Host "Portable startup configured: $launcherPath"
-    Write-Host 'No elevation, package registration, service installation, or sandbox-disabling flags were used.'
+    $configurationCommitted = $true
+    Write-Host "[成功] 免安装配置已完成：版本 $($package.Version)（$Architecture）。" -ForegroundColor Green
+    if ($shortcutPaths.Count -gt 0) {
+        Write-Host '下次可直接双击桌面或开始菜单中的“ChatGPT（免安装）”。'
+    } else {
+        Write-Host "下次可双击启动文件：$launcherPath"
+    }
+    if (-not $KeepOldVersions) { Remove-OldVersions -StorageRoot $StorageRoot -ActiveVersionDirectory $versionDirectory }
     if ($Launch) {
         $process = Start-Process -FilePath $executable -ArgumentList ('--user-data-dir="' + $profileDirectory + '"') -WorkingDirectory $appDirectory -WindowStyle Normal -PassThru
-        Write-Host "Launch requested (process $($process.Id)). Close an older running instance to switch versions."
+        try {
+            if ($process.WaitForExit(3000) -and $process.ExitCode -ne 0) {
+                throw "ChatGPT 启动后退出，退出码：$($process.ExitCode)。"
+            }
+            Write-Host "[成功] 已发出 ChatGPT 启动请求（进程 $($process.Id)）。" -ForegroundColor Green
+            Write-Host '请确认应用窗口已打开；若要切换版本，请先退出旧实例，再双击快捷方式。'
+        } finally {
+            $process.Dispose()
+        }
     }
-    $state | ConvertTo-Json -Depth 4
+    if ($OutputJson) { $state | ConvertTo-Json -Depth 4 }
 } catch {
-    Write-Error -Message $_.Exception.Message -ErrorAction Continue
+    if ($configurationCommitted) {
+        [Console]::Error.WriteLine('[失败] 免安装配置已保存，但启动未完成。可尝试使用桌面快捷方式重新启动。')
+    } else {
+        [Console]::Error.WriteLine('[失败] 免安装配置未完成。')
+    }
+    [Console]::Error.WriteLine(('原因：' + $_.Exception.Message))
     exit 1
 } finally {
     if ($null -ne $stageDirectory -and (Test-Path -LiteralPath $stageDirectory)) {

@@ -1,3 +1,6 @@
+# Local documentation is kept outside version control.
+/docs/
+
 # Default application files, account data, cache and configuration backups.
 _local/
 
@@ -8,6 +11,7 @@ staging/
 portable-profile/
 configuration-backups/
 active.json
+storage-root.json
 complete.json
 pipeline.lock
 Start-ChatGPT.cmd
