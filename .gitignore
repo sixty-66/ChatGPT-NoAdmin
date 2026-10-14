@@ -1,5 +1,5 @@
-# Local documentation is kept outside version control.
-/docs/
+# Keep the local installation article outside version control.
+/docs/chatgpt-windows-offline-and-noadmin.md
 
 # Default application files, account data, cache and configuration backups.
 _local/
