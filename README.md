@@ -1,4 +1,4 @@
-# ChatGPT-NoAdmin
+# gpt-NoAdmin免安装启动工具
 
 一个用于 Windows 的 ChatGPT 免安装启动工具：从 OpenAI 官方地址获取当前最新的完整 MSIX 包，验证签名后提取应用文件，并配置普通用户可以使用的启动入口，无需使用管理员权限。
 
